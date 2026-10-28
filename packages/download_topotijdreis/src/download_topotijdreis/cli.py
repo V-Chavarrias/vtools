@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """Download square Topotijdreis aerial-image crops for points in a CSV.
 
-From the repository root, create and populate a virtual environment:
+From a checkout of this repository, install the package and browser:
 
-    python -m venv .venv
-    .venv\\Scripts\\python.exe -m pip install -r rkm\\requirements.txt
-    $env:PLAYWRIGHT_BROWSERS_PATH = "$PWD\\.venv\\ms-playwright"
-    .venv\\Scripts\\python.exe -m playwright install chromium
+    python -m pip install .\\packages\\download_topotijdreis
+    python -m playwright install chromium
 
 Example:
-    .venv\\Scripts\\python.exe rkm\\download_topotijdreis.py \
-        --csv rkm\\rkm_maas.csv --years 2012 2020 --zoom 10 --size 512
+    python -m download_topotijdreis --csv rkm_maas.csv \
+        --years 2012 2020 --zoom 10 --size 512
 
 The CSV coordinates must be in EPSG:28992 (RD New), which Topotijdreis accepts
 directly in its satellite-view URL.
@@ -21,11 +19,10 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-import os
 import re
-import sys
 import time
 from collections import Counter
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -41,7 +38,6 @@ from playwright.sync_api import (
 )
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_SITE_URL = (
     "https://www.topotijdreis.nl/satelliet/2006/@136794,455874,3"
 )
@@ -276,7 +272,172 @@ def create_map_page(
     return page, tracker
 
 
-def parse_args() -> argparse.Namespace:
+def download_topotijdreis(
+    csv_path: str | Path,
+    years: Iterable[int],
+    output_dir: str | Path,
+    *,
+    site_url: str = DEFAULT_SITE_URL,
+    zoom: int = 10,
+    size: int = 512,
+    x_column: str = "X",
+    y_column: str = "Y",
+    tag_column: str = "MODELKM",
+    tile_timeout: float = 60,
+    retries: int = 3,
+    retry_delay: float = 5,
+) -> list[Path]:
+    """Download Topotijdreis image crops from a CSV.
+
+    The CSV coordinates must be in EPSG:28992 (RD New). Existing output files
+    are skipped. The returned paths contain one entry for every requested
+    location/year output, including files that already existed.
+    """
+    if zoom < 0:
+        raise ValueError("zoom must be zero or greater.")
+    if size <= ATTRIBUTION_BAND_HEIGHT:
+        raise ValueError(
+            f"size must be greater than {ATTRIBUTION_BAND_HEIGHT} pixels."
+        )
+    if tile_timeout <= 0:
+        raise ValueError("tile_timeout must be greater than zero.")
+    if retries < 1:
+        raise ValueError("retries must be at least one.")
+    if retry_delay < 0:
+        raise ValueError("retry_delay cannot be negative.")
+
+    years = list(dict.fromkeys(years))
+    if not years:
+        raise ValueError("Provide at least one year with years.")
+
+    csv_path = Path(csv_path)
+    output_dir = Path(output_dir)
+    locations = read_locations(csv_path, x_column, y_column, tag_column)
+    site_parts = satellite_base_url(site_url)
+    tag_counts = Counter(location.tag.casefold() for location in locations)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    viewport_size = max(size + 512, 1024)
+    completed: list[Path] = []
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page: Page | None = None
+        try:
+            page, tracker = create_map_page(
+                browser,
+                viewport_size,
+                tile_timeout,
+            )
+            map_surface = page.locator('[role="application"]')
+            total = len(locations) * len(years)
+            processed = 0
+            failed: list[str] = []
+
+            for location in locations:
+                for year in years:
+                    processed += 1
+                    destination = output_path_for(
+                        output_dir,
+                        location,
+                        year,
+                        tag_counts,
+                    )
+                    if destination.exists():
+                        print(f"[{processed}/{total}] Exists, skipping {destination}")
+                        completed.append(destination)
+                        continue
+
+                    page_url = build_page_url(
+                        site_parts,
+                        year,
+                        location.x,
+                        location.y,
+                        zoom,
+                    )
+                    for attempt in range(1, retries + 1):
+                        tile_count_before = tracker.total_started
+                        try:
+                            page.goto(page_url, wait_until="domcontentloaded")
+                            map_surface.wait_for(state="visible")
+                            tracker.wait_until_idle(
+                                page,
+                                tile_count_before,
+                                page_url,
+                                tile_timeout,
+                            )
+                            page.wait_for_timeout(250)
+
+                            selected_year = page.get_by_role(
+                                "combobox",
+                                name="Kies een jaar",
+                            ).input_value()
+                            if selected_year != str(year):
+                                raise RuntimeError(
+                                    f"Topotijdreis selected year {selected_year!r} "
+                                    f"instead of {year} at {page_url}."
+                                )
+
+                            source_credit = page.locator(
+                                ".esri-attribution__sources"
+                            ).inner_text().strip()
+                            powered_by = page.locator(
+                                ".esri-attribution__powered-by"
+                            ).inner_text().strip()
+                            if not source_credit or not powered_by:
+                                raise RuntimeError(
+                                    f"Could not read map attribution at {page_url}."
+                                )
+
+                            save_square_image(
+                                map_surface.screenshot(animations="disabled"),
+                                destination,
+                                size,
+                                f"{source_credit} | {powered_by}",
+                            )
+                        except (PlaywrightTimeoutError, TimeoutError) as error:
+                            page.close()
+                            if attempt == retries:
+                                message = f"{destination}: {error}"
+                                failed.append(message)
+                                print(f"[{processed}/{total}] Failed {message}")
+                                page, tracker = create_map_page(
+                                    browser,
+                                    viewport_size,
+                                    tile_timeout,
+                                )
+                                map_surface = page.locator('[role="application"]')
+                                break
+
+                            delay = retry_delay * attempt
+                            print(
+                                f"[{processed}/{total}] Retry "
+                                f"{attempt + 1}/{retries} in {delay:g}s "
+                                f"for {destination}: {error}"
+                            )
+                            time.sleep(delay)
+                            page, tracker = create_map_page(
+                                browser,
+                                viewport_size,
+                                tile_timeout,
+                            )
+                            map_surface = page.locator('[role="application"]')
+                        else:
+                            print(f"[{processed}/{total}] Saved {destination}")
+                            completed.append(destination)
+                            break
+            if failed:
+                details = "\n".join(f"  - {message}" for message in failed)
+                raise RuntimeError(
+                    f"Failed to download {len(failed)} image(s):\n{details}"
+                )
+        finally:
+            if page is not None and not page.is_closed():
+                page.close()
+            browser.close()
+    return completed
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Download square Topotijdreis aerial-image crops centered on "
@@ -286,8 +447,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--csv",
         type=Path,
-        default=SCRIPT_DIR / "rkm_maas.csv",
-        help="Input CSV (default: rkm/rkm_maas.csv).",
+        default=Path.cwd() / "rkm_maas.csv",
+        help="Input CSV (default: ./rkm_maas.csv).",
     )
     parser.add_argument(
         "--site-url",
@@ -297,8 +458,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=SCRIPT_DIR / "images",
-        help="Directory for PNG images (default: rkm/images).",
+        default=Path.cwd() / "images",
+        help="Directory for PNG images (default: ./images).",
     )
     parser.add_argument(
         "--years",
@@ -344,7 +505,7 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="Base delay in seconds between map retries (default: 5).",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.zoom < 0:
         parser.error("--zoom must be zero or greater.")
     if args.size <= ATTRIBUTION_BAND_HEIGHT:
@@ -362,136 +523,22 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def main() -> int:
-    args = parse_args()
-    os.environ.setdefault(
-        "PLAYWRIGHT_BROWSERS_PATH",
-        str(Path(sys.prefix) / "ms-playwright"),
-    )
-    locations = read_locations(
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    download_topotijdreis(
         args.csv,
-        args.x_column,
-        args.y_column,
-        args.tag_column,
+        args.years,
+        args.output_dir,
+        site_url=args.site_url,
+        zoom=args.zoom,
+        size=args.size,
+        x_column=args.x_column,
+        y_column=args.y_column,
+        tag_column=args.tag_column,
+        tile_timeout=args.tile_timeout,
+        retries=args.retries,
+        retry_delay=args.retry_delay,
     )
-    site_parts = satellite_base_url(args.site_url)
-    years = list(dict.fromkeys(args.years))
-    tag_counts = Counter(location.tag.casefold() for location in locations)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    viewport_size = max(args.size + 512, 1024)
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        try:
-            page, tracker = create_map_page(
-                browser,
-                viewport_size,
-                args.tile_timeout,
-            )
-            map_surface = page.locator('[role="application"]')
-            total = len(locations) * len(years)
-            processed = 0
-            failed: list[str] = []
-
-            for location in locations:
-                for year in years:
-                    processed += 1
-                    destination = output_path_for(
-                        args.output_dir,
-                        location,
-                        year,
-                        tag_counts,
-                    )
-                    if destination.exists():
-                        print(f"[{processed}/{total}] Exists, skipping {destination}")
-                        continue
-
-                    page_url = build_page_url(
-                        site_parts,
-                        year,
-                        location.x,
-                        location.y,
-                        args.zoom,
-                    )
-                    for attempt in range(1, args.retries + 1):
-                        tile_count_before = tracker.total_started
-                        try:
-                            page.goto(page_url, wait_until="domcontentloaded")
-                            map_surface.wait_for(state="visible")
-                            tracker.wait_until_idle(
-                                page,
-                                tile_count_before,
-                                page_url,
-                                args.tile_timeout,
-                            )
-                            page.wait_for_timeout(250)
-
-                            selected_year = page.get_by_role(
-                                "combobox",
-                                name="Kies een jaar",
-                            ).input_value()
-                            if selected_year != str(year):
-                                raise RuntimeError(
-                                    f"Topotijdreis selected year {selected_year!r} "
-                                    f"instead of {year} at {page_url}."
-                                )
-
-                            source_credit = page.locator(
-                                ".esri-attribution__sources"
-                            ).inner_text().strip()
-                            powered_by = page.locator(
-                                ".esri-attribution__powered-by"
-                            ).inner_text().strip()
-                            if not source_credit or not powered_by:
-                                raise RuntimeError(
-                                    f"Could not read map attribution at {page_url}."
-                                )
-
-                            save_square_image(
-                                map_surface.screenshot(animations="disabled"),
-                                destination,
-                                args.size,
-                                f"{source_credit} | {powered_by}",
-                            )
-                        except (PlaywrightTimeoutError, TimeoutError) as error:
-                            page.close()
-                            if attempt == args.retries:
-                                message = f"{destination}: {error}"
-                                failed.append(message)
-                                print(f"[{processed}/{total}] Failed {message}")
-                                page, tracker = create_map_page(
-                                    browser,
-                                    viewport_size,
-                                    args.tile_timeout,
-                                )
-                                map_surface = page.locator('[role="application"]')
-                                break
-
-                            delay = args.retry_delay * attempt
-                            print(
-                                f"[{processed}/{total}] Retry "
-                                f"{attempt + 1}/{args.retries} in {delay:g}s "
-                                f"for {destination}: {error}"
-                            )
-                            time.sleep(delay)
-                            page, tracker = create_map_page(
-                                browser,
-                                viewport_size,
-                                args.tile_timeout,
-                            )
-                            map_surface = page.locator('[role="application"]')
-                        else:
-                            print(f"[{processed}/{total}] Saved {destination}")
-                            break
-            if failed:
-                details = "\n".join(f"  - {message}" for message in failed)
-                raise RuntimeError(
-                    f"Failed to download {len(failed)} image(s):\n{details}"
-                )
-        finally:
-            if not page.is_closed():
-                page.close()
-            browser.close()
     return 0
 
 
